@@ -82,7 +82,9 @@ func InitMapReduce(nmap int, nreduce int,
 	mr.DoneChannel = make(chan bool)
 
 	// initialize any additional state here
-	mr.idleWorkerChannel = make(chan string)
+	// buffered so a worker returning itself never blocks waiting for a
+	// receiver that may have moved to the next phase or already returned.
+	mr.idleWorkerChannel = make(chan string, 100)
 	return mr
 }
 

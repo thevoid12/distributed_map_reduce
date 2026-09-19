@@ -50,14 +50,18 @@ func (mr *MapReduce) RunMaster() *list.List {
 	// once the worker is registered we are pusing it to register
 	// channel so once that is trigger we will write it back to idle channel
 	done := make(chan struct{})
+	stopped := make(chan struct{})
+	mr.Workers = make(map[string]*WorkerInfo)
 
 	go func() {
+		defer close(stopped)
 		for {
 			select {
 			case worker := <-mr.registerChannel:
+				mr.Workers[worker] = &WorkerInfo{address: worker}
 				mr.idleWorkerChannel <- worker
 			case <-done:
-				return // TODO: I need to handle this later and exits cleanly
+				return
 			}
 		}
 	}()
@@ -80,6 +84,27 @@ func (mr *MapReduce) RunMaster() *list.List {
 	// wait group to wait for
 	// all of the map to done to start reduce
 	wg.Wait()
-	// we will implement reduce later
+
+	// mapper is done and we will have individual smaller reducers
+	// we will resuse the same workers and make them act as reducers
+	for i := 0; i < mr.nReduce; i++ {
+		idleWorker := <-mr.idleWorkerChannel
+		wg.Add(1)
+
+		go mr.RPCMasterToWorker(idleWorker, DoJobArgs{
+			File:          mr.file,
+			Operation:     Reduce,
+			JobNumber:     i,
+			NumOtherPhase: mr.nMap,
+		}, &wg)
+	}
+	// waiting for all reducers to be done
+	wg.Wait()
+
+	// stop the registration forwarding goroutine and wait for it to
+	// actually exit
+	close(done)
+	<-stopped
+
 	return mr.KillWorkers()
 }
