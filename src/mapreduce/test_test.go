@@ -17,8 +17,6 @@ const (
 	nNumber = 100000
 	nMap    = 100
 	nReduce = 50
-	// nMap    = 3
-	// nReduce = 2
 )
 
 // Create input file with N numbers
