@@ -29,18 +29,68 @@ func (mr *MapReduce) KillWorkers() *list.List {
 	return l
 }
 
-func (mr *MapReduce) RPCMasterToWorker(worker string, args DoJobArgs, wg *sync.WaitGroup) {
-	defer wg.Done()
+// runTask sends one DoJob RPC and reports whether the worker actually
+// completed it. No retry here because the caller decides what to do on failure.
+func (mr *MapReduce) runTask(worker string, args *DoJobArgs) bool {
 	reply := DoJobReply{}
 	ok := call(worker, "Worker.DoJob", args, &reply)
-	if ok == false {
-		fmt.Printf("RPC error: RPC from master to worker %s  error\n", worker)
+	return ok && reply.OK
+}
+
+// schedulePhase hands out nTasks jobs of the given operation to idle workers,
+// retrying any task whose worker fails to complete it until every task has
+// succeeded exactly once.
+func (mr *MapReduce) schedulePhase(operation JobType, nTasks int, nOther int) {
+	pending := make(chan int, nTasks)
+	for i := 0; i < nTasks; i++ {
+		pending <- i
 	}
-	if !reply.OK {
-		fmt.Println("the worker has responded not okay to the master")
-	} else { // successful so worker job is done and its idle again
-		mr.idleWorkerChannel <- worker
-	}
+
+	var wg sync.WaitGroup
+	wg.Add(nTasks)
+
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+
+	go func() {
+		defer close(stopped)
+		for {
+			select {
+			case taskNum := <-pending:
+				worker := <-mr.idleWorkerChannel
+
+				go func(taskNum int, worker string) {
+					args := &DoJobArgs{
+						File:          mr.file,
+						Operation:     operation,
+						JobNumber:     taskNum,
+						NumOtherPhase: nOther,
+					}
+					if mr.runTask(worker, args) {
+						mr.idleWorkerChannel <- worker // worker is free again
+						wg.Done()                      // 1 task is done so making it done
+					} else {
+						fmt.Printf("schedulePhase: task %d failed on worker %s, retrying\n", taskNum, worker)
+						pending <- taskNum // someone else will pick this task up
+						// worker is presumed dead so we will put the task back in queue so that
+						// some other free worker will pick it up
+					}
+				}(taskNum, worker)
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	wg.Wait()
+	close(done)
+	// I am double checking it has because close(done) returning
+	// doesn't mean the goroutine has processed it yet
+	// the goroutine might still be mid-iteration doing something else
+	// at that exact moment.
+	// If the caller proceeded right after close(done) assuming the goroutine's gone,
+	//  it could still be running concurrently for a brief window
+	<-stopped
 }
 
 func (mr *MapReduce) RunMaster() *list.List {
@@ -66,40 +116,13 @@ func (mr *MapReduce) RunMaster() *list.List {
 		}
 	}()
 
-	var wg sync.WaitGroup
-	for i := 0; i < mr.nMap; i++ {
-		// we will keep assigning the various chunks
-		//  to various available worker to map parallelly
-		idleWorker := <-mr.idleWorkerChannel
-		wg.Add(1)
-
-		go mr.RPCMasterToWorker(idleWorker, DoJobArgs{
-			File:          mr.file,
-			Operation:     Map,
-			JobNumber:     i,
-			NumOtherPhase: mr.nReduce,
-		}, &wg)
-	}
-
-	// wait group to wait for
-	// all of the map to done to start reduce
-	wg.Wait()
+	// map phase: retries any task whose worker fails until all nMap
+	// tasks have succeeded
+	mr.schedulePhase(Map, mr.nMap, mr.nReduce)
 
 	// mapper is done and we will have individual smaller reducers
 	// we will resuse the same workers and make them act as reducers
-	for i := 0; i < mr.nReduce; i++ {
-		idleWorker := <-mr.idleWorkerChannel
-		wg.Add(1)
-
-		go mr.RPCMasterToWorker(idleWorker, DoJobArgs{
-			File:          mr.file,
-			Operation:     Reduce,
-			JobNumber:     i,
-			NumOtherPhase: mr.nMap,
-		}, &wg)
-	}
-	// waiting for all reducers to be done
-	wg.Wait()
+	mr.schedulePhase(Reduce, mr.nReduce, mr.nMap)
 
 	// stop the registration forwarding goroutine and wait for it to
 	// actually exit
